@@ -239,15 +239,13 @@ class OpenWebUIAdapter(BasePlatformAdapter):
                 "Open WebUI: joined channels (user=%s)",
                 uid or "unknown",
             )
-            # Send a test message to verify the socket path works
-            if self._channel_id and uid:
-                await self._sio.emit("channel-message", {
-                    "channel_id": self._channel_id,
-                    "data": {
-                        "content": "🤖 Hermes online! Listening for @hermes...",
-                        "data": {"files": []},
-                    },
-                })
+            # No announcement on connect: a gateway restart must not
+            # spam the channel. Set OPENWEBUI_ANNOUNCE=true to opt in.
+            if os.getenv("OPENWEBUI_ANNOUNCE") == "true" and self._channel_id and uid:
+                await self._post_channel_message(
+                    self._channel_id,
+                    "🤖 Hermes online! Listening for @hermes...",
+                )
 
         await self._sio.emit(
             "user-join",
@@ -537,9 +535,16 @@ class OpenWebUIAdapter(BasePlatformAdapter):
     # ── Socket send ──
 
     async def _send_socket(self, parent_id: str, text: str) -> None:
-        """Post a message in the thread via Socket.IO."""
-        if not self._sio or not self._sio.connected or not self._channel_id:
-            logger.warning("Open WebUI: cannot send (socket disconnected)")
+        """Post a message in the thread — Socket.IO first, REST fallback."""
+        if not self._channel_id:
+            logger.warning("Open WebUI: cannot send (no channel resolved)")
+            return
+        if not self._sio or not self._sio.connected:
+            result = await self._post_channel_message(
+                self._channel_id, text, parent_id=parent_id
+            )
+            if not result.success:
+                logger.warning("Open WebUI: REST thread reply failed: %s", result.error)
             return
         try:
             await self._sio.emit("channel-message", {
@@ -553,6 +558,63 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("send socket error: %s", e)
 
+    # ── Outbound via REST ──
+    # Posting uses the Channels REST API with the bot's API key — no
+    # Socket.IO / JWT session required, so gateway-initiated delivery
+    # (cron, send_message tool) works even when the socket is down.
+    # Endpoint verified against open-webui source (routers/channels.py):
+    #   POST /api/v1/channels/{id}/messages/post
+    #   body (models/messages.py MessageForm):
+    #   {content, parent_id?, reply_to_id?, data?} -> MessageModel
+
+    async def _post_channel_message(
+        self,
+        channel_id: str,
+        content: str,
+        parent_id: Optional[str] = None,
+    ) -> SendResult:
+        if not self.base_url or not self.api_key:
+            return SendResult(success=False, error="Open WebUI URL/API key not configured")
+        body: Dict[str, Any] = {"content": content, "data": {"files": []}}
+        if parent_id:
+            body["parent_id"] = parent_id
+        url = f"{self.base_url}/api/v1/channels/{channel_id}/messages/post"
+        try:
+            if self._http and not self._http.closed:
+                async with self._http.post(url, headers=self._ow_headers(), json=body) as r:
+                    return await self._send_result_from_response(r)
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(30)) as s:
+                async with s.post(url, headers=self._ow_headers(), json=body) as r:
+                    return await self._send_result_from_response(r)
+        except Exception as e:
+            return SendResult(success=False, error=f"REST post failed: {e}")
+
+    @staticmethod
+    async def _send_result_from_response(r) -> SendResult:
+        if r.status >= 400:
+            detail = (await r.text())[:300]
+            return SendResult(success=False, error=f"Open WebUI POST -> {r.status}: {detail}")
+        try:
+            data = await r.json()
+        except Exception:
+            data = None
+        msg_id = data.get("id") if isinstance(data, dict) else None
+        return SendResult(success=True, message_id=msg_id)
+
+    async def _resolve_target_channel(self, chat_id: Optional[str]) -> Optional[str]:
+        """Cron/send_message may address the home channel by name
+        (e.g. '#hermes', the OPENWEBUI_HOME_CHANNEL value) or by ID."""
+        if not chat_id:
+            return self._channel_id
+        if chat_id == self._channel_id:
+            return self._channel_id
+        if chat_id in (self.channel_name, self.home_channel):
+            return self._channel_id
+        # Looks like a raw channel ID different from the configured one.
+        if not chat_id.startswith("#") and " " not in chat_id:
+            return chat_id
+        return self._channel_id
+
     # ── BasePlatformAdapter send (for send_message tool / cron) ──
 
     async def send(
@@ -562,21 +624,24 @@ class OpenWebUIAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        target = chat_id or self._channel_id
+        target = await self._resolve_target_channel(chat_id)
         if not target:
-            return SendResult(success=False, error="No target")
-        try:
-            body = {"content": content, "data": {"files": []}}
-            if reply_to:
-                body["parent_id"] = reply_to
-            if self._sio and self._sio.connected:
-                await self._sio.emit("channel-message", {
-                    "channel_id": self._channel_id,
-                    "data": body,
-                })
-            return SendResult(success=True)
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error="No target channel resolved")
+        result = await self._post_channel_message(target, content, parent_id=reply_to)
+        if result.success:
+            return result
+        logger.warning("Open WebUI: REST send failed (%s); trying Socket.IO fallback", result.error)
+        # Socket.IO fallback is best-effort only: emit has no delivery
+        # ack, so never report success from it — surface the REST error.
+        if self._sio and self._sio.connected:
+            try:
+                body: Dict[str, Any] = {"content": content, "data": {"files": []}}
+                if reply_to:
+                    body["parent_id"] = reply_to
+                await self._sio.emit("channel-message", {"channel_id": target, "data": body})
+            except Exception as e:
+                logger.error("Open WebUI: socket fallback also failed: %s", e)
+        return result
 
     async def send_typing(self, chat_id: str) -> None:
         pass
